@@ -5,18 +5,18 @@ from json5 import load, loads
 from loguru import logger
 from os import environ, remove
 from telethon import TelegramClient, events
-from telethon.functions import messages as fun_messages
 from telethon.sessions import StringSession
 import re
 import telethon
 
 logger.trace("application started.")
 
+
 class Settings:
     def __init__(
         self,
-        secret_path = environ.get("TELEGRAM_SECRET_PATH", "./secret.json5"),
-        content = environ.get("TELEGRAM_SECRET", None)
+        secret_path=environ.get("TELEGRAM_SECRET_PATH", "./secret.json5"),
+        content=environ.get("TELEGRAM_SECRET", None),
     ):
         if content:
             logger.debug("use secret environment")
@@ -61,16 +61,12 @@ class Settings:
         return self.json.pop("bot_token")
 
     @property
-    def target_chat(self) -> int:
-        return self.json["target_chat"]
+    def source_chat(self) -> int | None:
+        return self.json.get("source_chat")
 
     @property
-    def source_chat(self) -> int:
-        return self.json["source_chat"]
-
-    @property
-    def search_only_regex(self) -> int:
-        return self.json["search_only_regex"]
+    def replies_messages(self) -> dict[str, str]:
+        return self.json["replies_messages"]
 
     @property
     def retries_max_count(self) -> int:
@@ -78,51 +74,35 @@ class Settings:
 
     @property
     def retries_sleep_seconds(self) -> int | float:
-        return self.json.pop("retries_sleep_seconds", 60*20)
+        return self.json.pop("retries_sleep_seconds", 60 * 20)
 
 
 settings = Settings()
 
-searcher_targets = re.compile(settings.search_only_regex)
+reply_rules: list[tuple[str, re.Pattern[str]]] = [
+    (reply_text, re.compile(pattern))
+    for reply_text, pattern in settings.replies_messages.items()
+]
 
 logger.trace("Init TelegramClient...")
 with TelegramClient(
     StringSession(settings.session_and_auth_key),
     settings.api_id,
     settings.api_hash,
-    base_logger=logger
+    base_logger=logger,
 ).start() as client:
     client: TelegramClient = client
     logger.trace("Telegram client instance created")
     if not settings.is_session_and_auth_key_configurated:
-        raise Exception(f"Use session, instead of api_id and api_hash. Set session_and_auth_key to value: «{client.session.save()}»")
+        raise Exception(
+            f"Use session, instead of api_id and api_hash. Set session_and_auth_key to value: «{client.session.save()}»"
+        )
 
-    def split_str_by_length(s: str, chunk_limit: int):
-        return [s[i:i+chunk_limit] for i in range(0, len(s), chunk_limit)]
-    
-    async def send_to_future(peer_id, msg, **kwargs) -> list[telethon.types.Message]:
-        logger.trace("send_to_future: begin")
-        logger.trace("Ready to send {} KiB", len(msg) / 1024)
-        sendent = []
-        if msg:
-            logger.trace(f"ready chars {len(msg)}")
-            msgs = split_str_by_length(msg, 4096)
-            logger.trace(f"splitted! count: {len(msgs)}")
-            logger.trace("Sending...")
-            for m in msgs:
-                sendent.append(await client.send_message(peer_id, m, **kwargs))
-            logger.trace("Sent.")
-        logger.trace("sendent: {sendent}", sendent=sendent)
-        return sendent
-    
-    async def getLinkOfMessage(message: telethon.tl.patched.Message):
-        chat: telethon.types.Chat = await message.get_chat()
-        if chat.username:
-            return f"https://t.me/{chat.username}/{message.id}"
-        else:
-            return f"https://t.me/c/{chat.id}/{message.id}"
-    
-    def retries(callback, max_count = settings.retries_max_count, sleep_seconds = settings.retries_sleep_seconds):
+    def retries(
+        callback,
+        max_count=settings.retries_max_count,
+        sleep_seconds=settings.retries_sleep_seconds,
+    ):
         async def wrapper(*args, **kwargs):
             tries = 0
             while True:
@@ -133,53 +113,58 @@ with TelegramClient(
                     if tries >= max_count:
                         raise Exception("Max retries exceeded", tries, max_count) from e
                     await sleep(sleep_seconds)
+
         return wrapper
 
-    async def forward_message(message: telethon.tl.patched.Message):
-        logger.debug("forward_message start: {}", message)
-        try:
-            result = await client.forward_messages(settings.target_chat, message)
-        except ValueError as e:
-            if "Could not find the input entity for" in e.args[0]:
-                await client.get_dialogs()
-                result = await client.forward_messages(settings.target_chat, message)
-            else:
-                raise
-        logger.debug("forward_message end, return: {}", result)
+    async def reply_to_message(
+        message: telethon.tl.patched.Message, reply_text: str
+    ) -> telethon.types.Message:
+        logger.debug("reply_to_message start: {} -> {}", message.id, reply_text)
+        result = await message.reply(reply_text)
+        logger.debug("reply_to_message end, return: {}", result)
         return result
 
-    forward_message_retry = retries(forward_message)
+    reply_to_message_retry = retries(reply_to_message)
 
-    async def unread_target_chat():
-        logger.debug("unread_target_chat start")
-        result = await client(fun_messages.MarkDialogUnreadRequest(
-            peer=settings.target_chat,
-            unread=True
-        ))
-        logger.debug("unread_target_chat end, return: {}", result)
-        return result
-
-    unread_target_chat_retry = retries(unread_target_chat, 2, 300)
-
-    async def alert(event: telethon.events.newmessage.NewMessage.Event):
+    async def on_new_message(event: telethon.events.newmessage.NewMessage.Event):
         message: telethon.tl.patched.Message = event.message
         if (await client.get_me()).id == message.sender_id:
             logger.warning("Sender is me! Skip: {}", message.message)
             return
-        matcher = searcher_targets.search(message.message)
-        if matcher == None:
-            logger.debug("no target message {}", message)
-        else:
-            await forward_message_retry(message)
-            await unread_target_chat_retry()
+        text = message.message or ""
+        for reply_text, pattern in reply_rules:
+            if pattern.search(text):
+                logger.info(
+                    "match {} in chat {}: {}",
+                    pattern.pattern,
+                    message.peer_id,
+                    text,
+                )
+                await reply_to_message_retry(message, reply_text)
+                return
+        logger.debug("no match for message {}", message.id)
 
-    @client.on(events.NewMessage(chats=settings.source_chat))
+    new_message_event = (
+        events.NewMessage()
+        if settings.source_chat is None
+        else events.NewMessage(chats=settings.source_chat)
+    )
+
+    @client.on(new_message_event)
     async def handler(event: telethon.events.newmessage.NewMessage.Event):
         try:
             message: telethon.tl.patched.Message = event.message
-            logger.info("got message {}: {}", message.peer_id, message.message)
-            await alert(event)
+            logger.info("got message {}, chat: {}, text: {}", message.peer_id, message.chat_id, message.message)
+            await on_new_message(event)
         except Exception as e:
             logger.exception(e)
-    logger.info("Telegram ready")
+
+    if settings.source_chat is None:
+        logger.info("Telegram ready, all chats, rules: {}", len(reply_rules))
+    else:
+        logger.info(
+            "Telegram ready, chat {}, rules: {}",
+            settings.source_chat,
+            len(reply_rules),
+        )
     client.run_until_disconnected()
