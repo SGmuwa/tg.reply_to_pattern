@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from asyncio import sleep as sleep
+from asyncio import create_task, sleep as sleep
 from json5 import load, loads
 from loguru import logger
 from os import environ, remove
@@ -76,6 +76,10 @@ class Settings:
     def retries_sleep_seconds(self) -> int | float:
         return self.json.pop("retries_sleep_seconds", 60 * 20)
 
+    @property
+    def auto_delete_reply_after_ms(self) -> int | float:
+        return self.json.pop("auto_delete_reply_after_ms", 0)
+
 
 settings = Settings()
 
@@ -126,6 +130,25 @@ with TelegramClient(
 
     reply_to_message_retry = retries(reply_to_message)
 
+    auto_delete_reply_after_ms = settings.auto_delete_reply_after_ms
+
+    async def schedule_delete_reply(sent: telethon.types.Message):
+        await sleep(auto_delete_reply_after_ms / 1000)
+        try:
+            await sent.delete()
+            logger.info(
+                "deleted reply {} in chat {} after {} ms",
+                sent.id,
+                sent.chat_id,
+                auto_delete_reply_after_ms,
+            )
+        except Exception as e:
+            logger.warning("can't delete reply {}: {}", sent.id, e)
+
+    def maybe_schedule_delete_reply(sent: telethon.types.Message):
+        if auto_delete_reply_after_ms > 0:
+            create_task(schedule_delete_reply(sent))
+
     async def on_new_message(event: telethon.events.newmessage.NewMessage.Event):
         message: telethon.tl.patched.Message = event.message
         if (await client.get_me()).id == message.sender_id:
@@ -140,7 +163,8 @@ with TelegramClient(
                     message.peer_id,
                     text,
                 )
-                await reply_to_message_retry(message, reply_text)
+                sent = await reply_to_message_retry(message, reply_text)
+                maybe_schedule_delete_reply(sent)
                 return
         logger.debug("no match for message {}", message.id)
 
@@ -167,4 +191,12 @@ with TelegramClient(
             settings.source_chat,
             len(reply_rules),
         )
+    if auto_delete_reply_after_ms > 0:
+        logger.info(
+            "auto-delete reply after {} ms ({:.1f} h)",
+            auto_delete_reply_after_ms,
+            auto_delete_reply_after_ms / 3_600_000,
+        )
+    else:
+        logger.info("auto-delete reply: disabled")
     client.run_until_disconnected()
