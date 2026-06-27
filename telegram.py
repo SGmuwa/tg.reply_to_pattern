@@ -6,10 +6,25 @@ from loguru import logger
 from os import environ, remove
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import MessageEntityTextUrl
 import re
 import telethon
 
 logger.trace("application started.")
+
+
+def build_search_text(message: telethon.tl.patched.Message) -> str:
+    text = message.message or ""
+    if not message.entities:
+        return text
+    hidden_urls = [
+        entity.url
+        for entity in message.entities
+        if isinstance(entity, MessageEntityTextUrl)
+    ]
+    if not hidden_urls:
+        return text
+    return text + "\n" + "\n".join(hidden_urls)
 
 
 class Settings:
@@ -154,7 +169,7 @@ with TelegramClient(
         if (await client.get_me()).id == message.sender_id:
             logger.warning("Sender is me! Skip: {}", message.message)
             return
-        text = message.message or ""
+        text = build_search_text(message)
         for reply_text, pattern in reply_rules:
             if pattern.search(text):
                 logger.info(
